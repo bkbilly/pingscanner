@@ -7,11 +7,11 @@ import ipaddress
 import asyncio
 import re
 from mac_vendor_lookup import AsyncMacLookup
+import socket
 
 
 class Networkscan:
     """Class Networkscan"""
-
 
     def __init__(self, ip_and_prefix):
         """Class init"""
@@ -25,8 +25,7 @@ class Networkscan:
             # Use ipaddress library
             self.network = ipaddress.ip_network(ip_and_prefix)
         except:
-            # Problem with input data
-            # Display error message and exit
+            # Problem with input network
             sys.exit("Incorrect network/prefix " + ip_and_prefix)
 
         # Calculate the number of hosts
@@ -36,8 +35,7 @@ class Networkscan:
         if self.network.num_addresses > 2:
             self.nbr_host -= 2
 
-
-    async def ping_coroutine(self, ip):
+    async def ping_coroutine(self, ip, checkmac, checkvendor):
         """ Async procedure
 
         ping_coroutine is the coroutine used to send a ping
@@ -45,9 +43,9 @@ class Networkscan:
 
         # Define the ping command used for one ping (Windows and Linux versions are different)
         if self.system == "windows":
-            one_ping_param = "ping -n 1 -l 1 -w 1000 "
+            one_ping_param = "ping -n 4 -l 1 -w 1000 "
         else:
-            one_ping_param = "ping -c 1 -s 1 -w 1 "
+            one_ping_param = "ping -c 4 -s 1 -w 1 "
 
         # Run the ping shell command
         # stderr is needed in order not to display "Do you want to ping broadcast? Then -b. If not,
@@ -63,47 +61,61 @@ class Networkscan:
         # Ping OK?
         if "ttl=" in str(stdout_ping).lower():
             # Ping OK
-            running_arp_coroutine = await asyncio.create_subprocess_shell(
-                "arp -a " + ip,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE)
+            mac, hostname = None, None
+            vendor = None
+            if checkmac:
+                mac, hostname = await self.mac_coroutine(ip)
+                if mac is not None:
+                    if checkvendor:
+                        vendor = await AsyncMacLookup().lookup(mac)
+                    self.list_of_hosts_found.append({
+                        'ip': ip,
+                        'mac': mac,
+                        'vendor': vendor,
+                        'hostname': hostname
+                    })
+            else:
+                self.list_of_hosts_found.append({'ip': ip})
 
-            # Suspends the current coroutine allowing other tasks to run
-            stdout_arp = await running_arp_coroutine.communicate()
-            arp_out = str(stdout_arp[0].decode('ascii'))
-            p = re.compile(r' (?:[0-9a-fA-F][:-]?){12}')
-            found_mac = re.findall(p, arp_out)
+    async def mac_coroutine(self, ip):
+        running_arp_coroutine = await asyncio.create_subprocess_shell(
+            f"arp -a {ip}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
 
-            mac = ""
-            vendor = ""
-            hostname = ""
-            if len(found_mac) > 0:
-                mac = found_mac[0].replace('-', ':').upper().strip()
-                vendor = await AsyncMacLookup().lookup(mac)
+        # Suspends the current coroutine allowing other tasks to run
+        stdout_arp = await running_arp_coroutine.communicate()
+        arp_out = str(stdout_arp[0].decode('ascii'))
+        p = re.compile(r' (?:[0-9a-fA-F][:-]?){12}')
+        found_mac = re.findall(p, arp_out)
 
-            if self.system != "windows" and mac != "":
-                p = re.compile(r'^[\w-]+')
-                find_hostname = re.findall(p, arp_out)
-                if len(find_hostname) > 0:
-                    hostname = find_hostname[0]
+        mac = None
+        hostname = None
+        if len(found_mac) > 0:
+            mac = found_mac[0].replace('-', ':').upper().strip()
+            hostname = await self.hostname_coroutine(ip, arp_out)
 
-            self.list_of_hosts_found.append({
-                'ip': ip,
-                'mac': mac,
-                'vendor': vendor,
-                'hostname': hostname
-            })
+        return mac, hostname
 
-    async def ping_loop(self):
+    async def hostname_coroutine(self, ip, arp_out):
+        if self.system == "windows":
+            hostname = socket.getfqdn(ip)
+        else:
+            p = re.compile(r'^[\w-]+')
+            find_hostname = re.findall(p, arp_out)
+            if len(find_hostname) > 0:
+                hostname = find_hostname[0]
+        return hostname
+
+    async def run_coroutins(self):
         """ Async procedure
 
-        ping_loop run the list of coroutines, list by list
+        run_coroutins run the list of coroutines, list by list
         """
 
         # Start the tasks
         # Wait until both tasks are completed
         # Run all commands
-        #print("len my_list_of_tasks:" + str(len(my_list_of_tasks)))
 
         # Read the lists one by one from the list of lists my_list_of_tasks
         for each_task_list in self.my_list_of_tasks:
@@ -111,7 +123,7 @@ class Networkscan:
             for each_coroutine in asyncio.as_completed(each_task_list):
                 await each_coroutine
 
-    def run(self):
+    def run(self, mac=True, vendor=False):
         """ Method used to create the task lists and to run the coroutine loop """
 
         # By default at the beginning of every scan there is no host found
@@ -133,7 +145,7 @@ class Networkscan:
         for host in hosts:
             # my_tasks is a list with coroutine tasks. It gets 2 parameters: one with
             #  the ping command and the other one with the ip address of the target
-            self.my_tasks.append(self.ping_coroutine(str(host)))
+            self.my_tasks.append(self.ping_coroutine(str(host), mac, vendor))
 
         # if Windows is in use then these commands are needed otherwise
         # "asyncio.create_subprocess_shell" will fail
@@ -142,14 +154,14 @@ class Networkscan:
                 asyncio.WindowsProactorEventLoopPolicy())
 
         # Run the coroutine loop
-        asyncio.run(self.ping_loop())
+        asyncio.run(self.run_coroutins())
 
 
 
 # Main function
 if __name__ == '__main__':
     # Create the object
-    my_scan = Networkscan("192.168.1.0/24")
+    my_scan = Networkscan("192.168.2.0/24")
 
     # Display information
     print("Network to scan: " + str(my_scan.network))
@@ -160,7 +172,7 @@ if __name__ == '__main__':
     print("Scanning hosts...")
 
     # Run the scan of hosts using pings
-    my_scan.run()
+    my_scan.run(mac=True, vendor=True)
 
     # Display the IP address of all the hosts found
     for i in my_scan.list_of_hosts_found:
